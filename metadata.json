@@ -1,0 +1,6 @@
+{
+  "name": "QuadFind",
+  "description": "College Lost & Found directory for reporting, matching, and recovering missing campus items.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
