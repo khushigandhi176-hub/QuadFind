@@ -1,10 +1,12 @@
 import type {
   CampusDesk,
+  CampusGoogleFormConfig,
   ItemCategory,
   ItemClaim,
   ItemStatus,
   ItemsResponse,
   LostFoundItem,
+  PhotoStorageProvider,
   ReportType,
 } from '../types';
 
@@ -81,13 +83,21 @@ export interface CreateReportPayload {
   building: string;
   locationDetail: string;
   dateOccurred: string;
+  timeOccurred?: string;
+  studentClass?: string;
+  department?: string;
+  lostInClass?: string;
   description: string;
   imageUrl?: string;
   imageDataUrl?: string;
+  storageProvider?: PhotoStorageProvider;
+  driveFileId?: string;
+  driveWebViewLink?: string;
   verificationQuestion?: string;
   handoffDesk?: string;
   reporterName: string;
   reporterEmail: string;
+  sourceFormResponseId?: string;
 }
 
 export async function createReport(
@@ -101,12 +111,17 @@ export async function createReport(
 
 export async function updateItemPhoto(
   itemId: string,
-  imageUrl: string | null,
+  payload: {
+    imageUrl: string | null;
+    storageProvider?: PhotoStorageProvider;
+    driveFileId?: string;
+    driveWebViewLink?: string;
+  },
   actorEmail: string,
 ): Promise<{ item: LostFoundItem }> {
   return requestJson<{ item: LostFoundItem }>(`/api/items/${itemId}/photo`, {
     method: 'PATCH',
-    body: JSON.stringify({ imageUrl, actorEmail }),
+    body: JSON.stringify({ ...payload, actorEmail }),
   });
 }
 
@@ -165,4 +180,23 @@ export async function fetchMyActivity(email: string): Promise<{
   return requestJson(
     `/api/my-activity?email=${encodeURIComponent(email.trim())}`,
   );
+}
+
+export async function fetchSavedGoogleForm(): Promise<{ form: CampusGoogleFormConfig | null }> {
+  return requestJson<{ form: CampusGoogleFormConfig | null }>('/api/google-form');
+}
+
+export async function saveGoogleFormConfig(
+  config: CampusGoogleFormConfig,
+): Promise<{ form: CampusGoogleFormConfig }> {
+  return requestJson<{ form: CampusGoogleFormConfig }>('/api/google-form', {
+    method: 'POST',
+    body: JSON.stringify(config),
+  });
+}
+
+export async function unlinkGoogleFormConfig(): Promise<{ ok: boolean }> {
+  return requestJson<{ ok: boolean }>('/api/google-form', {
+    method: 'DELETE',
+  });
 }

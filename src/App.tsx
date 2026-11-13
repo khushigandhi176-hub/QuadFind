@@ -10,14 +10,20 @@ import type {
 } from './types';
 import { fetchDesks, fetchItems } from './lib/api';
 import { CAMPUS_BUILDINGS, ITEM_CATEGORIES } from './lib/constants';
+import {
+  googleSignIn,
+  initAuth,
+  logoutGoogleWorkspace,
+} from './lib/googleWorkspaceAuth';
 import { HERO_CAMPUS_DESK_IMAGE } from './lib/itemImages';
 import { ItemCard } from './components/ItemCard';
 import { ItemDetailModal } from './components/ItemDetailModal';
 import { ReportItemModal } from './components/ReportItemModal';
 import { MyReportsView } from './components/MyReportsView';
+import { GoogleFormPanel } from './components/GoogleFormPanel';
 
 type DirectoryTab = 'active' | 'found' | 'lost' | 'returned';
-type PrimaryView = 'directory' | 'my-reports';
+type PrimaryView = 'directory' | 'google-form' | 'my-reports';
 
 const PROFILE_STORAGE_KEY = 'quadfind_student_profile_v1';
 
@@ -57,9 +63,39 @@ export default function App() {
   const [refreshTick, setRefreshTick] = useState(0);
 
   const [studentProfile, setStudentProfile] = useState<StudentProfile>(loadSavedProfile);
+  const [googleAccessToken, setGoogleAccessToken] = useState<string | null>(null);
+  const [googleUserEmail, setGoogleUserEmail] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<LostFoundItem | null>(null);
   const [reportModalOpen, setReportModalOpen] = useState(false);
   const [reportInitialType, setReportInitialType] = useState<ReportType>('found');
+
+  useEffect(() => {
+    const unsubscribe = initAuth(
+      (user, token) => {
+        setGoogleAccessToken(token);
+        setGoogleUserEmail(user.email || null);
+      },
+      () => {
+        setGoogleAccessToken(null);
+        setGoogleUserEmail(null);
+      },
+    );
+    return () => unsubscribe();
+  }, []);
+
+  const handleRequestGoogleSignIn = useCallback(async (): Promise<string | null> => {
+    if (googleAccessToken) return googleAccessToken;
+    const { user, accessToken } = await googleSignIn();
+    setGoogleAccessToken(accessToken);
+    setGoogleUserEmail(user.email || null);
+    return accessToken;
+  }, [googleAccessToken]);
+
+  const handleGoogleLogout = useCallback(async () => {
+    await logoutGoogleWorkspace();
+    setGoogleAccessToken(null);
+    setGoogleUserEmail(null);
+  }, []);
 
   const updateProfile = useCallback((next: StudentProfile) => {
     setStudentProfile(next);
@@ -172,6 +208,20 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
+                setView('google-form');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
+              className={`whitespace-nowrap shrink-0 py-1 transition-colors cursor-pointer ${
+                view === 'google-form'
+                  ? 'text-slate-900 underline underline-offset-8 decoration-2 decoration-blue-700'
+                  : 'hover:text-slate-900'
+              }`}
+            >
+              Google Form
+            </button>
+            <button
+              type="button"
+              onClick={() => {
                 setView('my-reports');
                 window.scrollTo({ top: 0, behavior: 'smooth' });
               }}
@@ -212,7 +262,17 @@ export default function App() {
       </header>
 
       <main id="top" className="flex-1">
-        {view === 'my-reports' ? (
+        {view === 'google-form' ? (
+          <GoogleFormPanel
+            googleAccessToken={googleAccessToken}
+            googleUserEmail={googleUserEmail}
+            onRequestGoogleSignIn={handleRequestGoogleSignIn}
+            onGoogleLogout={handleGoogleLogout}
+            existingItems={items}
+            onImportedToDirectory={triggerRefresh}
+            onBackToDirectory={() => setView('directory')}
+          />
+        ) : view === 'my-reports' ? (
           <MyReportsView
             studentProfile={studentProfile}
             onUpdateProfile={updateProfile}
@@ -310,6 +370,16 @@ export default function App() {
                 </div>
 
                 <div className="flex items-center gap-2 md:hidden">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setView('google-form');
+                      window.scrollTo({ top: 0, behavior: 'smooth' });
+                    }}
+                    className="px-3.5 py-2 text-xs font-medium text-blue-700 bg-white border border-blue-200 rounded-lg cursor-pointer"
+                  >
+                    Google Form
+                  </button>
                   <button
                     type="button"
                     onClick={() => setView('my-reports')}
@@ -588,6 +658,16 @@ export default function App() {
             <button
               type="button"
               onClick={() => {
+                setView('google-form');
+                window.scrollTo({ top: 0, behavior: 'smooth' });
+              }}
+              className="hover:text-slate-900 cursor-pointer"
+            >
+              Google Form
+            </button>
+            <button
+              type="button"
+              onClick={() => {
                 setView('my-reports');
                 window.scrollTo({ top: 0, behavior: 'smooth' });
               }}
@@ -606,6 +686,12 @@ export default function App() {
           desks={desks}
           studentProfile={studentProfile}
           onUpdateProfile={updateProfile}
+          googleAccessToken={googleAccessToken}
+          onRequestGoogleSignIn={handleRequestGoogleSignIn}
+          onOpenGoogleForm={() => {
+            setView('google-form');
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          }}
           onClose={() => setReportModalOpen(false)}
           onCreated={() => triggerRefresh()}
           onSelectMatch={(match) => setSelectedItem(match)}
@@ -616,6 +702,8 @@ export default function App() {
         item={selectedItem}
         studentProfile={studentProfile}
         onUpdateProfile={updateProfile}
+        googleAccessToken={googleAccessToken}
+        onRequestGoogleSignIn={handleRequestGoogleSignIn}
         onClose={() => setSelectedItem(null)}
         onItemChanged={triggerRefresh}
         onSelectItem={(match) => setSelectedItem(match)}

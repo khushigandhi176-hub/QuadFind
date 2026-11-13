@@ -1,6 +1,7 @@
 export type ReportType = 'lost' | 'found';
 export type ItemStatus = 'open' | 'claimed' | 'returned';
 export type ClaimStatus = 'pending' | 'approved' | 'declined';
+export type PhotoStorageProvider = 'system' | 'drive';
 
 export type ItemCategory =
   | 'Electronics'
@@ -33,18 +34,36 @@ export interface LostFoundItem {
   building: string;
   locationDetail: string;
   dateOccurred: string;
+  timeOccurred?: string;
+  studentClass?: string;
+  department?: string;
+  lostInClass?: string;
   description: string;
   imageKey?: string;
   imageUrl?: string;
   imageDataUrl?: string;
+  storageProvider?: PhotoStorageProvider;
+  driveFileId?: string;
+  driveWebViewLink?: string;
   verificationQuestion?: string;
   handoffDesk?: string;
   reporterName: string;
   reporterEmail: string;
+  sourceFormResponseId?: string;
   claims: ItemClaim[];
   createdAt: string;
   updatedAt: string;
   returnedAt?: string;
+}
+
+export interface CampusGoogleFormConfig {
+  formId: string;
+  title: string;
+  responderUri: string;
+  editUri: string;
+  createdBy: string;
+  createdAt: string;
+  questionMap?: Record<string, string>;
 }
 
 export interface CampusDesk {

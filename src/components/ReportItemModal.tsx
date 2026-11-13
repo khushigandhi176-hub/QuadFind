@@ -1,11 +1,20 @@
 import { useState, type FormEvent } from 'react';
-import { ArrowRight, X } from 'lucide-react';
+import { ArrowRight, FileSpreadsheet, X } from 'lucide-react';
 import type { CampusDesk, ItemCategory, LostFoundItem, ReportType, StudentProfile } from '../types';
 import { createReport } from '../lib/api';
 import { CAMPUS_BUILDINGS, ITEM_CATEGORIES } from '../lib/constants';
 import { resolveItemImage } from '../lib/itemImages';
 import { StatusIndicator } from './ItemCard';
-import { PhotoUploadField } from './PhotoUploadField';
+import { PhotoUploadField, type PhotoUploadValue } from './PhotoUploadField';
+
+const CLASS_LEVEL_OPTIONS = [
+  'Freshman (1st Year)',
+  'Sophomore (2nd Year)',
+  'Junior (3rd Year)',
+  'Senior (4th Year)',
+  'Graduate Student',
+  'Faculty / Staff',
+];
 
 interface ReportItemModalProps {
   isOpen: boolean;
@@ -13,6 +22,9 @@ interface ReportItemModalProps {
   desks: CampusDesk[];
   studentProfile: StudentProfile;
   onUpdateProfile: (profile: StudentProfile) => void;
+  googleAccessToken: string | null;
+  onRequestGoogleSignIn: () => Promise<string | null>;
+  onOpenGoogleForm: () => void;
   onClose: () => void;
   onCreated: (item: LostFoundItem) => void;
   onSelectMatch: (item: LostFoundItem) => void;
@@ -24,6 +36,9 @@ export function ReportItemModal({
   desks,
   studentProfile,
   onUpdateProfile,
+  googleAccessToken,
+  onRequestGoogleSignIn,
+  onOpenGoogleForm,
   onClose,
   onCreated,
   onSelectMatch,
@@ -34,12 +49,16 @@ export function ReportItemModal({
   const [building, setBuilding] = useState(CAMPUS_BUILDINGS[0]);
   const [locationDetail, setLocationDetail] = useState('');
   const [dateOccurred, setDateOccurred] = useState(() => new Date().toISOString().slice(0, 10));
+  const [timeOccurred, setTimeOccurred] = useState('');
+  const [studentClass, setStudentClass] = useState('');
+  const [department, setDepartment] = useState('');
+  const [lostInClass, setLostInClass] = useState('');
   const [description, setDescription] = useState('');
   const [verificationQuestion, setVerificationQuestion] = useState('');
   const [handoffDesk, setHandoffDesk] = useState('');
   const [reporterName, setReporterName] = useState(studentProfile.name);
   const [reporterEmail, setReporterEmail] = useState(studentProfile.email);
-  const [imageUrl, setImageUrl] = useState<string | undefined>(undefined);
+  const [photo, setPhoto] = useState<PhotoUploadValue | undefined>(undefined);
   const [photoUploading, setPhotoUploading] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -62,8 +81,15 @@ export function ReportItemModal({
         building,
         locationDetail,
         dateOccurred,
+        timeOccurred: timeOccurred.trim() || undefined,
+        studentClass: studentClass.trim() || undefined,
+        department: department.trim() || undefined,
+        lostInClass: lostInClass.trim() || undefined,
         description,
-        imageUrl,
+        imageUrl: photo?.imageUrl,
+        storageProvider: photo?.storageProvider,
+        driveFileId: photo?.driveFileId,
+        driveWebViewLink: photo?.driveWebViewLink,
         verificationQuestion: type === 'found' ? verificationQuestion : undefined,
         handoffDesk: type === 'found' ? handoffDesk : undefined,
         reporterName,
@@ -181,32 +207,48 @@ export function ReportItemModal({
           </div>
         ) : (
           <form onSubmit={handleSubmit} className="p-6 space-y-5">
-            <div>
-              <label className="block text-xs font-medium text-slate-600 mb-2">
-                Report Type
-              </label>
-              <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-100">
+              <div className="flex-1">
+                <label className="block text-xs font-medium text-slate-600 mb-2">
+                  Report Type
+                </label>
+                <div className="grid grid-cols-2 gap-1 p-1 bg-slate-100 rounded-lg">
+                  <button
+                    type="button"
+                    onClick={() => setType('found')}
+                    className={`py-2 px-4 text-sm font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                      type === 'found'
+                        ? 'bg-white text-slate-900 shadow-sm'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    I Found an Item
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setType('lost')}
+                    className={`py-2 px-4 text-sm font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
+                      type === 'lost'
+                        ? 'bg-white text-slate-900 shadow-sm'
+                        : 'text-slate-600 hover:text-slate-900'
+                    }`}
+                  >
+                    I Lost an Item
+                  </button>
+                </div>
+              </div>
+
+              <div className="sm:pt-6 shrink-0">
                 <button
                   type="button"
-                  onClick={() => setType('found')}
-                  className={`py-2 px-4 text-sm font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
-                    type === 'found'
-                      ? 'bg-white text-slate-900 shadow-sm'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
+                  onClick={() => {
+                    onClose();
+                    onOpenGoogleForm();
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-medium text-blue-700 hover:text-blue-800 bg-blue-50/70 hover:bg-blue-50 border border-blue-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
                 >
-                  I Found an Item
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setType('lost')}
-                  className={`py-2 px-4 text-sm font-medium rounded-md transition-colors whitespace-nowrap cursor-pointer ${
-                    type === 'lost'
-                      ? 'bg-white text-slate-900 shadow-sm'
-                      : 'text-slate-600 hover:text-slate-900'
-                  }`}
-                >
-                  I Lost an Item
+                  <FileSpreadsheet className="w-3.5 h-3.5" aria-hidden="true" />
+                  Use Campus Google Form
                 </button>
               </div>
             </div>
@@ -246,18 +288,32 @@ export function ReportItemModal({
                 </select>
               </div>
 
-              <div>
-                <label htmlFor="report-date" className="block text-sm font-medium text-slate-700 mb-1.5">
-                  Date {type === 'found' ? 'Found' : 'Lost'}
-                </label>
-                <input
-                  id="report-date"
-                  type="date"
-                  required
-                  value={dateOccurred}
-                  onChange={(e) => setDateOccurred(e.target.value)}
-                  className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700/20 focus:border-blue-700"
-                />
+              <div className="grid grid-cols-2 gap-2.5">
+                <div>
+                  <label htmlFor="report-date" className="block text-sm font-medium text-slate-700 mb-1.5">
+                    Date {type === 'found' ? 'Found' : 'Lost'}
+                  </label>
+                  <input
+                    id="report-date"
+                    type="date"
+                    required
+                    value={dateOccurred}
+                    onChange={(e) => setDateOccurred(e.target.value)}
+                    className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700/20 focus:border-blue-700"
+                  />
+                </div>
+                <div>
+                  <label htmlFor="report-time" className="block text-sm font-medium text-slate-700 mb-1.5">
+                    Time {type === 'found' ? 'Found' : 'Lost'}
+                  </label>
+                  <input
+                    id="report-time"
+                    type="time"
+                    value={timeOccurred}
+                    onChange={(e) => setTimeOccurred(e.target.value)}
+                    className="w-full px-3 py-2.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700/20 focus:border-blue-700"
+                  />
+                </div>
               </div>
 
               <div>
@@ -289,6 +345,55 @@ export function ReportItemModal({
                   value={locationDetail}
                   onChange={(e) => setLocationDetail(e.target.value)}
                   placeholder="e.g., 2nd Floor Study Tables"
+                  className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700/20 focus:border-blue-700"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="report-class" className="block text-sm font-medium text-slate-700 mb-1.5">
+                  Your Class / Academic Year
+                </label>
+                <select
+                  id="report-class"
+                  value={studentClass}
+                  onChange={(e) => setStudentClass(e.target.value)}
+                  className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700/20 focus:border-blue-700"
+                >
+                  <option value="">Select class (optional)</option>
+                  {CLASS_LEVEL_OPTIONS.map((opt) => (
+                    <option key={opt} value={opt}>
+                      {opt}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
+                <label htmlFor="report-department" className="block text-sm font-medium text-slate-700 mb-1.5">
+                  Department
+                </label>
+                <input
+                  id="report-department"
+                  type="text"
+                  maxLength={100}
+                  value={department}
+                  onChange={(e) => setDepartment(e.target.value)}
+                  placeholder="e.g., Computer Science, Mechanical Eng."
+                  className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700/20 focus:border-blue-700"
+                />
+              </div>
+
+              <div className="sm:col-span-2">
+                <label htmlFor="report-lost-in-class" className="block text-sm font-medium text-slate-700 mb-1.5">
+                  In Which Class / Lecture Was It {type === 'found' ? 'Found' : 'Lost'}?
+                </label>
+                <input
+                  id="report-lost-in-class"
+                  type="text"
+                  maxLength={120}
+                  value={lostInClass}
+                  onChange={(e) => setLostInClass(e.target.value)}
+                  placeholder="e.g., CS 201 · Lecture Hall 3B"
                   className="w-full px-3.5 py-2.5 text-sm bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-700/20 focus:border-blue-700"
                 />
               </div>
@@ -353,12 +458,14 @@ export function ReportItemModal({
 
             <div>
               <span className="block text-sm font-medium text-slate-700 mb-1.5">
-                Item Photo (Optional)
+                Item Photo (Optional — System or Google Drive)
               </span>
               <PhotoUploadField
-                value={imageUrl}
-                onChange={setImageUrl}
+                value={photo}
+                onChange={setPhoto}
                 onBusyChange={setPhotoUploading}
+                googleAccessToken={googleAccessToken}
+                onRequestGoogleSignIn={onRequestGoogleSignIn}
               />
             </div>
 

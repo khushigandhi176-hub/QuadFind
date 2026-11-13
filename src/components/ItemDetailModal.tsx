@@ -1,10 +1,14 @@
 import { useEffect, useState, type FormEvent } from 'react';
 import {
   ArrowRight,
+  BookOpen,
   Building2,
   Calendar,
   Camera,
   Check,
+  Cloud,
+  ExternalLink,
+  GraduationCap,
   MapPin,
   Maximize2,
   PackageCheck,
@@ -22,15 +26,18 @@ import {
   updateItemPhoto,
   updateItemStatus,
 } from '../lib/api';
+import { deleteDriveFile } from '../lib/googleDrive';
 import { formatRelativeTime, formatShortDate } from '../lib/constants';
 import { resolveItemImage } from '../lib/itemImages';
 import { StatusIndicator } from './ItemCard';
-import { PhotoUploadField } from './PhotoUploadField';
+import { PhotoUploadField, type PhotoUploadValue } from './PhotoUploadField';
 
 interface ItemDetailModalProps {
   item: LostFoundItem | null;
   studentProfile: StudentProfile;
   onUpdateProfile: (profile: StudentProfile) => void;
+  googleAccessToken: string | null;
+  onRequestGoogleSignIn: () => Promise<string | null>;
   onClose: () => void;
   onItemChanged: () => void;
   onSelectItem: (item: LostFoundItem) => void;
@@ -40,6 +47,8 @@ export function ItemDetailModal({
   item,
   studentProfile,
   onUpdateProfile,
+  googleAccessToken,
+  onRequestGoogleSignIn,
   onClose,
   onItemChanged,
   onSelectItem,
@@ -58,6 +67,9 @@ export function ItemDetailModal({
   const [error, setError] = useState<string | null>(null);
 
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [alsoDeleteDriveOnReport, setAlsoDeleteDriveOnReport] = useState(false);
+  const [pendingPhotoRemove, setPendingPhotoRemove] = useState(false);
+  const [alsoDeleteDriveOnPhoto, setAlsoDeleteDriveOnPhoto] = useState(false);
   const [actionBusy, setActionBusy] = useState(false);
   const [reporterVerifyEmail, setReporterVerifyEmail] = useState('');
   const [showReporterUnlock, setShowReporterUnlock] = useState(false);
@@ -69,6 +81,9 @@ export function ItemDetailModal({
     setClaimFeedback(null);
     setError(null);
     setConfirmDelete(false);
+    setAlsoDeleteDriveOnReport(false);
+    setPendingPhotoRemove(false);
+    setAlsoDeleteDriveOnPhoto(false);
     setVerificationAnswer('');
     setMessage('');
     setLightboxOpen(false);
@@ -100,6 +115,15 @@ export function ItemDetailModal({
   const isReporter =
     studentProfile.email.trim().toLowerCase() === detail.reporterEmail.trim().toLowerCase();
   const imageSrc = resolveItemImage(detail);
+
+  const currentPhotoValue: PhotoUploadValue | undefined = detail.imageUrl
+    ? {
+        imageUrl: detail.imageUrl,
+        storageProvider: detail.storageProvider ?? 'system',
+        driveFileId: detail.driveFileId,
+        driveWebViewLink: detail.driveWebViewLink,
+      }
+    : undefined;
 
   const handleClaimSubmit = async (e: FormEvent) => {
     e.preventDefault();
@@ -165,6 +189,16 @@ export function ItemDetailModal({
     setError(null);
     setActionBusy(true);
     try {
+      if (alsoDeleteDriveOnReport && detail.driveFileId) {
+        let token = googleAccessToken;
+        if (!token) {
+          token = await onRequestGoogleSignIn();
+        }
+        if (!token) {
+          throw new Error('Sign in with Google to delete the linked photo from Google Drive.');
+        }
+        await deleteDriveFile(token, detail.driveFileId);
+      }
       await deleteItem(detail.id, studentProfile.email);
       onItemChanged();
       onClose();
@@ -185,16 +219,60 @@ export function ItemDetailModal({
     setShowReporterUnlock(false);
   };
 
-  const handlePhotoChange = async (nextUrl: string | undefined) => {
+  const handlePhotoChange = async (next: PhotoUploadValue | undefined) => {
+    if (!next && detail.driveFileId) {
+      setPendingPhotoRemove(true);
+      setAlsoDeleteDriveOnPhoto(false);
+      return;
+    }
+
     setError(null);
     setActionBusy(true);
     try {
-      const res = await updateItemPhoto(detail.id, nextUrl ?? null, studentProfile.email);
+      const res = await updateItemPhoto(
+        detail.id,
+        next
+          ? {
+              imageUrl: next.imageUrl,
+              storageProvider: next.storageProvider,
+              driveFileId: next.driveFileId,
+              driveWebViewLink: next.driveWebViewLink,
+            }
+          : { imageUrl: null },
+        studentProfile.email,
+      );
       setDetail(res.item);
       setEditingPhoto(false);
+      setPendingPhotoRemove(false);
       onItemChanged();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not update photo.');
+    } finally {
+      setActionBusy(false);
+    }
+  };
+
+  const handleConfirmPhotoRemove = async () => {
+    setError(null);
+    setActionBusy(true);
+    try {
+      if (alsoDeleteDriveOnPhoto && detail.driveFileId) {
+        let token = googleAccessToken;
+        if (!token) {
+          token = await onRequestGoogleSignIn();
+        }
+        if (!token) {
+          throw new Error('Sign in with Google to remove the photo from Google Drive.');
+        }
+        await deleteDriveFile(token, detail.driveFileId);
+      }
+      const res = await updateItemPhoto(detail.id, { imageUrl: null }, studentProfile.email);
+      setDetail(res.item);
+      setPendingPhotoRemove(false);
+      setEditingPhoto(false);
+      onItemChanged();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not remove photo.');
     } finally {
       setActionBusy(false);
     }
@@ -269,8 +347,29 @@ export function ItemDetailModal({
                 <span>
                   {detail.type === 'found' ? 'Found on ' : 'Lost on '}
                   {formatShortDate(detail.dateOccurred)}
+                  {detail.timeOccurred ? (
+                    <span className="font-mono tabular-nums text-slate-600">
+                      {' · '}at {detail.timeOccurred}
+                    </span>
+                  ) : null}
                 </span>
               </div>
+              {detail.lostInClass && (
+                <div className="flex items-start gap-3">
+                  <BookOpen className="w-4 h-4 text-slate-400 mt-0.5 shrink-0" />
+                  <span>
+                    In class: <span className="font-medium text-slate-900">{detail.lostInClass}</span>
+                  </span>
+                </div>
+              )}
+              {(detail.studentClass || detail.department) && (
+                <div className="flex items-start gap-3">
+                  <GraduationCap className="w-4 h-4 text-slate-400 mt-0.5 shrink-0" />
+                  <span>
+                    {[detail.studentClass, detail.department].filter(Boolean).join(' · ')}
+                  </span>
+                </div>
+              )}
               <div className="flex items-center gap-3">
                 <User className="w-4 h-4 text-slate-400 shrink-0" />
                 <span>Reported by {detail.reporterName}</span>
@@ -281,6 +380,24 @@ export function ItemDetailModal({
                   <span className="text-slate-900 font-medium">
                     Held at {detail.handoffDesk}
                   </span>
+                </div>
+              )}
+              {detail.storageProvider === 'drive' && detail.driveWebViewLink && (
+                <div className="flex items-center gap-3">
+                  <Cloud className="w-4 h-4 text-blue-700 shrink-0" />
+                  <div className="flex items-center gap-2 text-xs">
+                    <span className="text-slate-600">Photo stored in Google Drive</span>
+                    <span aria-hidden="true">·</span>
+                    <a
+                      href={detail.driveWebViewLink}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="inline-flex items-center gap-1 font-medium text-blue-700 hover:underline"
+                    >
+                      Open in Drive
+                      <ExternalLink className="w-3 h-3" />
+                    </a>
+                  </div>
                 </div>
               )}
             </div>
@@ -347,7 +464,10 @@ export function ItemDetailModal({
                     <button
                       type="button"
                       disabled={actionBusy}
-                      onClick={() => setEditingPhoto((prev) => !prev)}
+                      onClick={() => {
+                        setPendingPhotoRemove(false);
+                        setEditingPhoto((prev) => !prev);
+                      }}
                       className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
                     >
                       <Camera className="w-3.5 h-3.5" />
@@ -374,7 +494,7 @@ export function ItemDetailModal({
                       </button>
                     )}
 
-                    {!confirmDelete ? (
+                    {!confirmDelete && (
                       <button
                         type="button"
                         onClick={() => setConfirmDelete(true)}
@@ -383,30 +503,105 @@ export function ItemDetailModal({
                       >
                         <Trash2 className="w-4 h-4" />
                       </button>
-                    ) : (
-                      <button
-                        type="button"
-                        disabled={actionBusy}
-                        onClick={handleDelete}
-                        className="px-2.5 py-1 text-xs font-medium text-white bg-red-700 hover:bg-red-800 rounded-md cursor-pointer"
-                      >
-                        Confirm Delete
-                      </button>
                     )}
                   </div>
                 </div>
 
-                {editingPhoto && (
-                  <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-2">
-                    <p className="text-xs font-medium text-slate-700">
-                      Attach or Replace Item Photo
+                {confirmDelete && (
+                  <div className="p-3.5 bg-red-50 border border-red-200 rounded-xl space-y-2.5">
+                    <p className="text-xs font-medium text-red-900">
+                      Permanently delete this report from the campus directory?
                     </p>
-                    <PhotoUploadField
-                      compact
-                      value={detail.imageUrl || imageSrc || undefined}
-                      onChange={handlePhotoChange}
-                    />
+                    {detail.driveFileId && (
+                      <label className="flex items-center gap-2 text-xs text-red-800 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={alsoDeleteDriveOnReport}
+                          onChange={(e) => setAlsoDeleteDriveOnReport(e.target.checked)}
+                          className="rounded border-red-300 text-red-700 focus:ring-red-600"
+                        />
+                        <span>Also delete the linked photo file from Google Drive</span>
+                      </label>
+                    )}
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={actionBusy}
+                        onClick={handleDelete}
+                        className="px-3 py-1.5 text-xs font-medium text-white bg-red-700 hover:bg-red-800 rounded-md cursor-pointer"
+                      >
+                        {actionBusy ? 'Deleting...' : 'Confirm Delete'}
+                      </button>
+                      <button
+                        type="button"
+                        disabled={actionBusy}
+                        onClick={() => {
+                          setConfirmDelete(false);
+                          setAlsoDeleteDriveOnReport(false);
+                        }}
+                        className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
                   </div>
+                )}
+
+                {editingPhoto && (
+                  <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+                    <p className="text-xs font-medium text-slate-700">
+                      Attach or Replace Item Photo (System or Google Drive)
+                    </p>
+                    {pendingPhotoRemove && detail.driveFileId ? (
+                      <div className="p-3 bg-white border border-slate-200 rounded-lg space-y-2.5">
+                        <p className="text-xs font-medium text-slate-900">
+                          Remove this photo from the listing?
+                        </p>
+                        <label className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={alsoDeleteDriveOnPhoto}
+                            onChange={(e) => setAlsoDeleteDriveOnPhoto(e.target.checked)}
+                            className="rounded border-slate-300 text-blue-700 focus:ring-blue-700"
+                          />
+                          <span>Also delete the linked file from Google Drive</span>
+                        </label>
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={handleConfirmPhotoRemove}
+                            className="px-3 py-1.5 text-xs font-medium text-white bg-red-700 hover:bg-red-800 rounded-md cursor-pointer"
+                          >
+                            {actionBusy ? 'Removing...' : 'Confirm Remove'}
+                          </button>
+                          <button
+                            type="button"
+                            disabled={actionBusy}
+                            onClick={() => setPendingPhotoRemove(false)}
+                            className="px-3 py-1.5 text-xs font-medium text-slate-700 bg-white border border-slate-300 hover:bg-slate-50 rounded-md cursor-pointer"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <PhotoUploadField
+                        compact
+                        value={currentPhotoValue}
+                        onChange={handlePhotoChange}
+                        onBusyChange={setActionBusy}
+                        googleAccessToken={googleAccessToken}
+                        onRequestGoogleSignIn={onRequestGoogleSignIn}
+                      />
+                    )}
+                  </div>
+                )}
+
+                {error && (
+                  <p className="text-xs text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+                    {error}
+                  </p>
                 )}
 
                 <div>

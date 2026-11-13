@@ -4,12 +4,14 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import type {
   CampusDesk,
+  CampusGoogleFormConfig,
   ClaimStatus,
   DirectorySummary,
   ItemCategory,
   ItemClaim,
   ItemStatus,
   LostFoundItem,
+  PhotoStorageProvider,
   ReportType,
 } from './src/types.ts';
 
@@ -109,6 +111,7 @@ const CAMPUS_DESKS: CampusDesk[] = [
 interface StoreShape {
   nextCaseSeq: number;
   items: LostFoundItem[];
+  googleForm?: CampusGoogleFormConfig;
 }
 
 function createSeedStore(): StoreShape {
@@ -476,6 +479,78 @@ async function startServer() {
     }
   });
 
+  app.get('/api/google-form', async (_req, res) => {
+    try {
+      const form = await withStore(async (store) => ({
+        result: store.googleForm ?? null,
+        dirty: false,
+      }));
+      res.json({ form });
+    } catch (err) {
+      console.error('GET /api/google-form error:', err);
+      res.status(500).json({ error: 'Failed to load Google Form configuration.' });
+    }
+  });
+
+  app.post('/api/google-form', async (req, res) => {
+    try {
+      const body = req.body ?? {};
+      const formId = sanitizeText(body.formId, 160);
+      const title = sanitizeText(body.title, 200);
+      const responderUri = sanitizeText(body.responderUri, 400);
+      const editUri = sanitizeText(body.editUri, 400);
+      const createdBy = sanitizeEmail(body.createdBy);
+      const createdAt = sanitizeText(body.createdAt, 40) || new Date().toISOString();
+
+      if (!formId || !responderUri.startsWith('https://')) {
+        res.status(400).json({ error: 'Valid Google Form ID and responder URL are required.' });
+        return;
+      }
+
+      const questionMap: Record<string, string> = {};
+      if (body.questionMap && typeof body.questionMap === 'object') {
+        for (const [k, v] of Object.entries(body.questionMap)) {
+          if (typeof k === 'string' && typeof v === 'string') {
+            questionMap[k.slice(0, 80)] = v.slice(0, 40);
+          }
+        }
+      }
+
+      const saved: CampusGoogleFormConfig = {
+        formId,
+        title: title || 'QuadFind — Campus Lost & Found Report Form',
+        responderUri,
+        editUri: editUri || responderUri,
+        createdBy: createdBy || 'campus-user',
+        createdAt,
+        questionMap,
+      };
+
+      await withStore(async (store) => {
+        store.googleForm = saved;
+        return { result: saved, dirty: true };
+      });
+
+      res.status(201).json({ form: saved });
+    } catch (err) {
+      console.error('POST /api/google-form error:', err);
+      res.status(500).json({ error: 'Failed to save Google Form configuration.' });
+    }
+  });
+
+  app.delete('/api/google-form', async (_req, res) => {
+    try {
+      await withStore(async (store) => {
+        delete store.googleForm;
+        return { result: true, dirty: true };
+      });
+      res.json({ ok: true });
+    } catch (err) {
+      console.error('DELETE /api/google-form error:', err);
+      res.status(500).json({ error: 'Failed to disconnect Google Form.' });
+    }
+  });
+
   app.get('/api/items/:id', async (req, res) => {
     try {
       const itemId = sanitizeText(req.params.id, 64);
@@ -516,11 +591,24 @@ async function startServer() {
       const building = sanitizeText(body.building, 80);
       const locationDetail = sanitizeText(body.locationDetail, 120);
       const dateOccurred = sanitizeText(body.dateOccurred, 20) || new Date().toISOString().slice(0, 10);
+      const timeOccurred = sanitizeText(body.timeOccurred, 20);
+      const studentClass = sanitizeText(body.studentClass, 80);
+      const department = sanitizeText(body.department, 100);
+      const lostInClass = sanitizeText(body.lostInClass, 120);
       const description = sanitizeText(body.description, 800);
       const verificationQuestion = sanitizeText(body.verificationQuestion, 200);
       const handoffDesk = sanitizeText(body.handoffDesk, 120);
       const reporterName = sanitizeText(body.reporterName, 80);
       const reporterEmail = sanitizeEmail(body.reporterEmail);
+      const sourceFormResponseId = sanitizeText(body.sourceFormResponseId, 120);
+
+      const storageProvider: PhotoStorageProvider | undefined =
+        body.storageProvider === 'drive' || body.storageProvider === 'system'
+          ? body.storageProvider
+          : undefined;
+      const driveFileId = sanitizeText(body.driveFileId, 160);
+      const rawDriveLink = sanitizeText(body.driveWebViewLink, 400);
+      const driveWebViewLink = rawDriveLink.startsWith('https://') ? rawDriveLink : undefined;
 
       let imageUrl = validateUploadUrl(body.imageUrl);
       let imageDataUrl: string | undefined;
@@ -557,13 +645,21 @@ async function startServer() {
           building,
           locationDetail: locationDetail || 'General area',
           dateOccurred,
+          timeOccurred: timeOccurred || undefined,
+          studentClass: studentClass || undefined,
+          department: department || undefined,
+          lostInClass: lostInClass || undefined,
           description,
           imageUrl,
           imageDataUrl,
+          storageProvider: imageUrl ? (storageProvider ?? 'system') : undefined,
+          driveFileId: driveFileId || undefined,
+          driveWebViewLink,
           verificationQuestion: verificationQuestion || undefined,
           handoffDesk: handoffDesk || undefined,
           reporterName,
           reporterEmail,
+          sourceFormResponseId: sourceFormResponseId || undefined,
           claims: [],
           createdAt: nowIso,
           updatedAt: nowIso,
@@ -784,6 +880,13 @@ async function startServer() {
       const body = req.body ?? {};
       const actorEmail = sanitizeEmail(body.actorEmail);
       const nextImageUrl = body.imageUrl === null ? null : validateUploadUrl(body.imageUrl);
+      const storageProvider: PhotoStorageProvider | undefined =
+        body.storageProvider === 'drive' || body.storageProvider === 'system'
+          ? body.storageProvider
+          : undefined;
+      const driveFileId = sanitizeText(body.driveFileId, 160);
+      const rawDriveLink = sanitizeText(body.driveWebViewLink, 400);
+      const driveWebViewLink = rawDriveLink.startsWith('https://') ? rawDriveLink : undefined;
 
       if (!actorEmail || (body.imageUrl !== null && !nextImageUrl)) {
         res.status(400).json({ error: 'Valid photo URL and reporter email are required.' });
@@ -810,6 +913,13 @@ async function startServer() {
         if (nextImageUrl === null) {
           item.imageDataUrl = undefined;
           item.imageKey = undefined;
+          item.storageProvider = undefined;
+          item.driveFileId = undefined;
+          item.driveWebViewLink = undefined;
+        } else {
+          item.storageProvider = storageProvider ?? 'system';
+          item.driveFileId = driveFileId || undefined;
+          item.driveWebViewLink = driveWebViewLink;
         }
         item.updatedAt = new Date().toISOString();
         return { result: { ok: true, status: 200, data: { item } }, dirty: true };
