@@ -1,7 +1,9 @@
 import express from 'express';
 import fs from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { fileURLToPath } from 'node:url';
 import type {
   CampusDesk,
   CampusGoogleFormConfig,
@@ -16,7 +18,13 @@ import type {
 } from './src/types.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
-const DATA_DIR = path.join(process.cwd(), 'data');
+const isServerless = Boolean(
+  process.env.NETLIFY || process.env.AWS_LAMBDA_FUNCTION_NAME || process.env.LAMBDA_TASK_ROOT,
+);
+const BUNDLED_DATA_FILE = path.join(process.cwd(), 'data', 'lost_and_found.json');
+const DATA_DIR = isServerless
+  ? path.join(os.tmpdir(), 'quadfind-data')
+  : path.join(process.cwd(), 'data');
 const UPLOAD_DIR = path.join(DATA_DIR, 'uploads');
 const DATA_FILE = path.join(DATA_DIR, 'lost_and_found.json');
 const MAX_UPLOAD_BYTES = 2 * 1024 * 1024;
@@ -287,6 +295,18 @@ async function ensureStore(): Promise<StoreShape> {
     }
     return parsed;
   } catch {
+    if (isServerless) {
+      try {
+        const bundledRaw = await fs.readFile(BUNDLED_DATA_FILE, 'utf8');
+        const bundledParsed = JSON.parse(bundledRaw) as StoreShape;
+        if (bundledParsed && Array.isArray(bundledParsed.items)) {
+          await fs.writeFile(DATA_FILE, JSON.stringify(bundledParsed, null, 2), 'utf8');
+          return bundledParsed;
+        }
+      } catch {
+        // Fall through to seed store when bundled data file is not present
+      }
+    }
     const seeded = createSeedStore();
     await fs.writeFile(DATA_FILE, JSON.stringify(seeded, null, 2), 'utf8');
     return seeded;
@@ -390,644 +410,652 @@ function redactItemForViewer(item: LostFoundItem, viewerEmail?: string): LostFou
   };
 }
 
-async function startServer() {
-  const app = express();
-  app.use(express.json({ limit: '4mb' }));
+export const app = express();
+app.use(express.json({ limit: '4mb' }));
 
-  app.get('/api/health', (_req, res) => {
-    res.json({ ok: true });
-  });
+const apiRouter = express.Router();
 
-  app.post('/api/uploads', async (req, res) => {
-    try {
-      const dataUrl = typeof req.body?.dataUrl === 'string' ? req.body.dataUrl : '';
-      if (!dataUrl) {
-        res.status(400).json({ error: 'Image payload is required.' });
-        return;
-      }
-      const saved = await saveUploadedDataUrl(dataUrl);
-      res.status(201).json(saved);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to upload image.';
-      res.status(400).json({ error: message });
-    }
-  });
+apiRouter.get('/health', (_req, res) => {
+  res.json({ ok: true });
+});
 
-  app.get('/api/uploads/:filename', async (req, res) => {
-    const filename = req.params.filename;
-    if (!SAFE_UPLOAD_NAME_RE.test(filename)) {
-      res.status(400).json({ error: 'Invalid image path.' });
+apiRouter.post('/uploads', async (req, res) => {
+  try {
+    const dataUrl = typeof req.body?.dataUrl === 'string' ? req.body.dataUrl : '';
+    if (!dataUrl) {
+      res.status(400).json({ error: 'Image payload is required.' });
       return;
     }
-    const filePath = path.join(UPLOAD_DIR, filename);
-    try {
-      const data = await fs.readFile(filePath);
-      const contentType = filename.endsWith('.png') ? 'image/png' : 'image/jpeg';
-      res.setHeader('Content-Type', contentType);
-      res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
-      res.send(data);
-    } catch {
-      res.status(404).json({ error: 'Uploaded image not found.' });
-    }
-  });
+    const saved = await saveUploadedDataUrl(dataUrl);
+    res.status(201).json(saved);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : 'Failed to upload image.';
+    res.status(400).json({ error: message });
+  }
+});
 
-  app.get('/api/desks', (_req, res) => {
-    res.json({ desks: CAMPUS_DESKS });
-  });
+apiRouter.get('/uploads/:filename', async (req, res) => {
+  const filename = req.params.filename;
+  if (!SAFE_UPLOAD_NAME_RE.test(filename)) {
+    res.status(400).json({ error: 'Invalid image path.' });
+    return;
+  }
+  const filePath = path.join(UPLOAD_DIR, filename);
+  try {
+    const data = await fs.readFile(filePath);
+    const contentType = filename.endsWith('.png') ? 'image/png' : 'image/jpeg';
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+    res.send(data);
+  } catch {
+    res.status(404).json({ error: 'Uploaded image not found.' });
+  }
+});
 
-  app.get('/api/items', async (req, res) => {
-    try {
-      const typeFilter = sanitizeText(req.query.type, 20);
-      const statusFilter = sanitizeText(req.query.status, 20);
-      const categoryFilter = sanitizeText(req.query.category, 60);
-      const buildingFilter = sanitizeText(req.query.building, 60);
-      const queryText = sanitizeText(req.query.q, 100).toLowerCase();
-      const viewerEmail = sanitizeEmail(req.query.viewerEmail);
+apiRouter.get('/desks', (_req, res) => {
+  res.json({ desks: CAMPUS_DESKS });
+});
 
-      const payload = await withStore(async (store) => {
-        const summary = computeSummary(store.items);
+apiRouter.get('/items', async (req, res) => {
+  try {
+    const typeFilter = sanitizeText(req.query.type, 20);
+    const statusFilter = sanitizeText(req.query.status, 20);
+    const categoryFilter = sanitizeText(req.query.category, 60);
+    const buildingFilter = sanitizeText(req.query.building, 60);
+    const queryText = sanitizeText(req.query.q, 100).toLowerCase();
+    const viewerEmail = sanitizeEmail(req.query.viewerEmail);
 
-        const filtered = store.items
-          .filter((item) => {
-            if (typeFilter && typeFilter !== 'all' && item.type !== typeFilter) return false;
-            if (statusFilter && statusFilter !== 'all') {
-              if (statusFilter === 'active' && item.status === 'returned') return false;
-              if (statusFilter !== 'active' && item.status !== statusFilter) return false;
-            }
-            if (categoryFilter && categoryFilter !== 'all' && item.category !== categoryFilter) {
-              return false;
-            }
-            if (buildingFilter && buildingFilter !== 'all' && item.building !== buildingFilter) {
-              return false;
-            }
-            if (queryText) {
-              const haystack = `${item.caseNumber} ${item.title} ${item.description} ${item.building} ${item.locationDetail} ${item.category}`.toLowerCase();
-              if (!haystack.includes(queryText)) return false;
-            }
-            return true;
-          })
-          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-          .map((item) => redactItemForViewer(item, viewerEmail));
+    const payload = await withStore(async (store) => {
+      const summary = computeSummary(store.items);
 
-        return { result: { items: filtered, summary }, dirty: false };
-      });
-
-      res.json(payload);
-    } catch (err) {
-      console.error('GET /api/items error:', err);
-      res.status(500).json({ error: 'Failed to load items.' });
-    }
-  });
-
-  app.get('/api/google-form', async (_req, res) => {
-    try {
-      const form = await withStore(async (store) => ({
-        result: store.googleForm ?? null,
-        dirty: false,
-      }));
-      res.json({ form });
-    } catch (err) {
-      console.error('GET /api/google-form error:', err);
-      res.status(500).json({ error: 'Failed to load Google Form configuration.' });
-    }
-  });
-
-  app.post('/api/google-form', async (req, res) => {
-    try {
-      const body = req.body ?? {};
-      const formId = sanitizeText(body.formId, 160);
-      const title = sanitizeText(body.title, 200);
-      const responderUri = sanitizeText(body.responderUri, 400);
-      const editUri = sanitizeText(body.editUri, 400);
-      const createdBy = sanitizeEmail(body.createdBy);
-      const createdAt = sanitizeText(body.createdAt, 40) || new Date().toISOString();
-
-      if (!formId || !responderUri.startsWith('https://')) {
-        res.status(400).json({ error: 'Valid Google Form ID and responder URL are required.' });
-        return;
-      }
-
-      const questionMap: Record<string, string> = {};
-      if (body.questionMap && typeof body.questionMap === 'object') {
-        for (const [k, v] of Object.entries(body.questionMap)) {
-          if (typeof k === 'string' && typeof v === 'string') {
-            questionMap[k.slice(0, 80)] = v.slice(0, 40);
+      const filtered = store.items
+        .filter((item) => {
+          if (typeFilter && typeFilter !== 'all' && item.type !== typeFilter) return false;
+          if (statusFilter && statusFilter !== 'all') {
+            if (statusFilter === 'active' && item.status === 'returned') return false;
+            if (statusFilter !== 'active' && item.status !== statusFilter) return false;
           }
+          if (categoryFilter && categoryFilter !== 'all' && item.category !== categoryFilter) {
+            return false;
+          }
+          if (buildingFilter && buildingFilter !== 'all' && item.building !== buildingFilter) {
+            return false;
+          }
+          if (queryText) {
+            const haystack = `${item.caseNumber} ${item.title} ${item.description} ${item.building} ${item.locationDetail} ${item.category}`.toLowerCase();
+            if (!haystack.includes(queryText)) return false;
+          }
+          return true;
+        })
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
+        .map((item) => redactItemForViewer(item, viewerEmail));
+
+      return { result: { items: filtered, summary }, dirty: false };
+    });
+
+    res.json(payload);
+  } catch (err) {
+    console.error('GET /api/items error:', err);
+    res.status(500).json({ error: 'Failed to load items.' });
+  }
+});
+
+apiRouter.get('/google-form', async (_req, res) => {
+  try {
+    const form = await withStore(async (store) => ({
+      result: store.googleForm ?? null,
+      dirty: false,
+    }));
+    res.json({ form });
+  } catch (err) {
+    console.error('GET /api/google-form error:', err);
+    res.status(500).json({ error: 'Failed to load Google Form configuration.' });
+  }
+});
+
+apiRouter.post('/google-form', async (req, res) => {
+  try {
+    const body = req.body ?? {};
+    const formId = sanitizeText(body.formId, 160);
+    const title = sanitizeText(body.title, 200);
+    const responderUri = sanitizeText(body.responderUri, 400);
+    const editUri = sanitizeText(body.editUri, 400);
+    const createdBy = sanitizeEmail(body.createdBy);
+    const createdAt = sanitizeText(body.createdAt, 40) || new Date().toISOString();
+
+    if (!formId || !responderUri.startsWith('https://')) {
+      res.status(400).json({ error: 'Valid Google Form ID and responder URL are required.' });
+      return;
+    }
+
+    const questionMap: Record<string, string> = {};
+    if (body.questionMap && typeof body.questionMap === 'object') {
+      for (const [k, v] of Object.entries(body.questionMap)) {
+        if (typeof k === 'string' && typeof v === 'string') {
+          questionMap[k.slice(0, 80)] = v.slice(0, 40);
         }
       }
+    }
 
-      const saved: CampusGoogleFormConfig = {
-        formId,
-        title: title || 'QuadFind — Campus Lost & Found Report Form',
-        responderUri,
-        editUri: editUri || responderUri,
-        createdBy: createdBy || 'campus-user',
-        createdAt,
-        questionMap,
+    const saved: CampusGoogleFormConfig = {
+      formId,
+      title: title || 'QuadFind — Campus Lost & Found Report Form',
+      responderUri,
+      editUri: editUri || responderUri,
+      createdBy: createdBy || 'campus-user',
+      createdAt,
+      questionMap,
+    };
+
+    await withStore(async (store) => {
+      store.googleForm = saved;
+      return { result: saved, dirty: true };
+    });
+
+    res.status(201).json({ form: saved });
+  } catch (err) {
+    console.error('POST /api/google-form error:', err);
+    res.status(500).json({ error: 'Failed to save Google Form configuration.' });
+  }
+});
+
+apiRouter.delete('/google-form', async (_req, res) => {
+  try {
+    await withStore(async (store) => {
+      delete store.googleForm;
+      return { result: true, dirty: true };
+    });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('DELETE /api/google-form error:', err);
+    res.status(500).json({ error: 'Failed to disconnect Google Form.' });
+  }
+});
+
+apiRouter.get('/items/:id', async (req, res) => {
+  try {
+    const itemId = sanitizeText(req.params.id, 64);
+    const viewerEmail = sanitizeEmail(req.query.viewerEmail);
+
+    const data = await withStore(async (store) => {
+      const found = store.items.find((i) => i.id === itemId);
+      if (!found) return { result: null, dirty: false };
+      const matches = findPotentialMatches(found, store.items).map((m) =>
+        redactItemForViewer(m, viewerEmail),
+      );
+      return {
+        result: {
+          item: redactItemForViewer(found, viewerEmail),
+          matches,
+        },
+        dirty: false,
+      };
+    });
+
+    if (!data) {
+      res.status(404).json({ error: 'Report not found.' });
+      return;
+    }
+    res.json(data);
+  } catch (err) {
+    console.error('GET /api/items/:id error:', err);
+    res.status(500).json({ error: 'Failed to load item details.' });
+  }
+});
+
+apiRouter.post('/items', async (req, res) => {
+  try {
+    const body = req.body ?? {};
+    const type = body.type === 'lost' || body.type === 'found' ? (body.type as ReportType) : null;
+    const title = sanitizeText(body.title, 120);
+    const category = VALID_CATEGORIES.includes(body.category) ? (body.category as ItemCategory) : null;
+    const building = sanitizeText(body.building, 80);
+    const locationDetail = sanitizeText(body.locationDetail, 120);
+    const dateOccurred = sanitizeText(body.dateOccurred, 20) || new Date().toISOString().slice(0, 10);
+    const timeOccurred = sanitizeText(body.timeOccurred, 20);
+    const studentClass = sanitizeText(body.studentClass, 80);
+    const department = sanitizeText(body.department, 100);
+    const lostInClass = sanitizeText(body.lostInClass, 120);
+    const description = sanitizeText(body.description, 800);
+    const verificationQuestion = sanitizeText(body.verificationQuestion, 200);
+    const handoffDesk = sanitizeText(body.handoffDesk, 120);
+    const reporterName = sanitizeText(body.reporterName, 80);
+    const reporterEmail = sanitizeEmail(body.reporterEmail);
+    const sourceFormResponseId = sanitizeText(body.sourceFormResponseId, 120);
+
+    const storageProvider: PhotoStorageProvider | undefined =
+      body.storageProvider === 'drive' || body.storageProvider === 'system'
+        ? body.storageProvider
+        : undefined;
+    const driveFileId = sanitizeText(body.driveFileId, 160);
+    const rawDriveLink = sanitizeText(body.driveWebViewLink, 400);
+    const driveWebViewLink = rawDriveLink.startsWith('https://') ? rawDriveLink : undefined;
+
+    let imageUrl = validateUploadUrl(body.imageUrl);
+    let imageDataUrl: string | undefined;
+
+    if (!imageUrl && typeof body.imageDataUrl === 'string' && body.imageDataUrl.trim()) {
+      try {
+        const saved = await saveUploadedDataUrl(body.imageDataUrl);
+        imageUrl = saved.imageUrl;
+      } catch (uploadErr) {
+        res.status(400).json({
+          error: uploadErr instanceof Error ? uploadErr.message : 'Invalid image upload.',
+        });
+        return;
+      }
+    }
+
+    if (!type || !title || !category || !building || !description || !reporterName || !reporterEmail) {
+      res.status(400).json({ error: 'Please complete all required fields before submitting.' });
+      return;
+    }
+
+    const created = await withStore(async (store) => {
+      const nowIso = new Date().toISOString();
+      const caseNumber = `LF-${store.nextCaseSeq}`;
+      store.nextCaseSeq += 1;
+
+      const newItem: LostFoundItem = {
+        id: `item-${crypto.randomUUID().slice(0, 8)}`,
+        caseNumber,
+        type,
+        status: 'open',
+        title,
+        category,
+        building,
+        locationDetail: locationDetail || 'General area',
+        dateOccurred,
+        timeOccurred: timeOccurred || undefined,
+        studentClass: studentClass || undefined,
+        department: department || undefined,
+        lostInClass: lostInClass || undefined,
+        description,
+        imageUrl,
+        imageDataUrl,
+        storageProvider: imageUrl ? (storageProvider ?? 'system') : undefined,
+        driveFileId: driveFileId || undefined,
+        driveWebViewLink,
+        verificationQuestion: verificationQuestion || undefined,
+        handoffDesk: handoffDesk || undefined,
+        reporterName,
+        reporterEmail,
+        sourceFormResponseId: sourceFormResponseId || undefined,
+        claims: [],
+        createdAt: nowIso,
+        updatedAt: nowIso,
       };
 
-      await withStore(async (store) => {
-        store.googleForm = saved;
-        return { result: saved, dirty: true };
-      });
+      store.items.unshift(newItem);
+      const matches = findPotentialMatches(newItem, store.items).map((m) =>
+        redactItemForViewer(m, reporterEmail),
+      );
 
-      res.status(201).json({ form: saved });
-    } catch (err) {
-      console.error('POST /api/google-form error:', err);
-      res.status(500).json({ error: 'Failed to save Google Form configuration.' });
+      return {
+        result: { item: newItem, matches },
+        dirty: true,
+      };
+    });
+
+    res.status(201).json(created);
+  } catch (err) {
+    console.error('POST /api/items error:', err);
+    res.status(500).json({ error: 'Failed to create report.' });
+  }
+});
+
+apiRouter.post('/items/:id/claims', async (req, res) => {
+  try {
+    const itemId = sanitizeText(req.params.id, 64);
+    const body = req.body ?? {};
+    const claimantName = sanitizeText(body.claimantName, 80);
+    const claimantEmail = sanitizeEmail(body.claimantEmail);
+    const claimantPhone = sanitizeText(body.claimantPhone, 30);
+    const verificationAnswer = sanitizeText(body.verificationAnswer, 300);
+    const message = sanitizeText(body.message, 500);
+
+    if (!claimantName || !claimantEmail || !verificationAnswer) {
+      res.status(400).json({ error: 'Name, college email, and verification details are required.' });
+      return;
     }
-  });
 
-  app.delete('/api/google-form', async (_req, res) => {
-    try {
-      await withStore(async (store) => {
-        delete store.googleForm;
-        return { result: true, dirty: true };
-      });
-      res.json({ ok: true });
-    } catch (err) {
-      console.error('DELETE /api/google-form error:', err);
-      res.status(500).json({ error: 'Failed to disconnect Google Form.' });
-    }
-  });
-
-  app.get('/api/items/:id', async (req, res) => {
-    try {
-      const itemId = sanitizeText(req.params.id, 64);
-      const viewerEmail = sanitizeEmail(req.query.viewerEmail);
-
-      const data = await withStore(async (store) => {
-        const found = store.items.find((i) => i.id === itemId);
-        if (!found) return { result: null, dirty: false };
-        const matches = findPotentialMatches(found, store.items).map((m) =>
-          redactItemForViewer(m, viewerEmail),
-        );
-        return {
-          result: {
-            item: redactItemForViewer(found, viewerEmail),
-            matches,
-          },
-          dirty: false,
-        };
-      });
-
-      if (!data) {
-        res.status(404).json({ error: 'Report not found.' });
-        return;
-      }
-      res.json(data);
-    } catch (err) {
-      console.error('GET /api/items/:id error:', err);
-      res.status(500).json({ error: 'Failed to load item details.' });
-    }
-  });
-
-  app.post('/api/items', async (req, res) => {
-    try {
-      const body = req.body ?? {};
-      const type = body.type === 'lost' || body.type === 'found' ? (body.type as ReportType) : null;
-      const title = sanitizeText(body.title, 120);
-      const category = VALID_CATEGORIES.includes(body.category) ? (body.category as ItemCategory) : null;
-      const building = sanitizeText(body.building, 80);
-      const locationDetail = sanitizeText(body.locationDetail, 120);
-      const dateOccurred = sanitizeText(body.dateOccurred, 20) || new Date().toISOString().slice(0, 10);
-      const timeOccurred = sanitizeText(body.timeOccurred, 20);
-      const studentClass = sanitizeText(body.studentClass, 80);
-      const department = sanitizeText(body.department, 100);
-      const lostInClass = sanitizeText(body.lostInClass, 120);
-      const description = sanitizeText(body.description, 800);
-      const verificationQuestion = sanitizeText(body.verificationQuestion, 200);
-      const handoffDesk = sanitizeText(body.handoffDesk, 120);
-      const reporterName = sanitizeText(body.reporterName, 80);
-      const reporterEmail = sanitizeEmail(body.reporterEmail);
-      const sourceFormResponseId = sanitizeText(body.sourceFormResponseId, 120);
-
-      const storageProvider: PhotoStorageProvider | undefined =
-        body.storageProvider === 'drive' || body.storageProvider === 'system'
-          ? body.storageProvider
-          : undefined;
-      const driveFileId = sanitizeText(body.driveFileId, 160);
-      const rawDriveLink = sanitizeText(body.driveWebViewLink, 400);
-      const driveWebViewLink = rawDriveLink.startsWith('https://') ? rawDriveLink : undefined;
-
-      let imageUrl = validateUploadUrl(body.imageUrl);
-      let imageDataUrl: string | undefined;
-
-      if (!imageUrl && typeof body.imageDataUrl === 'string' && body.imageDataUrl.trim()) {
-        try {
-          const saved = await saveUploadedDataUrl(body.imageDataUrl);
-          imageUrl = saved.imageUrl;
-        } catch (uploadErr) {
-          res.status(400).json({
-            error: uploadErr instanceof Error ? uploadErr.message : 'Invalid image upload.',
-          });
-          return;
+    const outcome = await withStore<StoreOutcome<{ item: LostFoundItem; claim: ItemClaim }>>(
+      async (store) => {
+        const item = store.items.find((i) => i.id === itemId);
+        if (!item) {
+          return { result: { ok: false, error: 'Item not found.', status: 404 }, dirty: false };
         }
-      }
+        if (item.status === 'returned') {
+          return {
+            result: { ok: false, error: 'This item has already been returned.', status: 400 },
+            dirty: false,
+          };
+        }
 
-      if (!type || !title || !category || !building || !description || !reporterName || !reporterEmail) {
-        res.status(400).json({ error: 'Please complete all required fields before submitting.' });
-        return;
-      }
-
-      const created = await withStore(async (store) => {
         const nowIso = new Date().toISOString();
-        const caseNumber = `LF-${store.nextCaseSeq}`;
-        store.nextCaseSeq += 1;
-
-        const newItem: LostFoundItem = {
-          id: `item-${crypto.randomUUID().slice(0, 8)}`,
-          caseNumber,
-          type,
-          status: 'open',
-          title,
-          category,
-          building,
-          locationDetail: locationDetail || 'General area',
-          dateOccurred,
-          timeOccurred: timeOccurred || undefined,
-          studentClass: studentClass || undefined,
-          department: department || undefined,
-          lostInClass: lostInClass || undefined,
-          description,
-          imageUrl,
-          imageDataUrl,
-          storageProvider: imageUrl ? (storageProvider ?? 'system') : undefined,
-          driveFileId: driveFileId || undefined,
-          driveWebViewLink,
-          verificationQuestion: verificationQuestion || undefined,
-          handoffDesk: handoffDesk || undefined,
-          reporterName,
-          reporterEmail,
-          sourceFormResponseId: sourceFormResponseId || undefined,
-          claims: [],
+        const claim: ItemClaim = {
+          id: `claim-${crypto.randomUUID().slice(0, 8)}`,
+          itemId: item.id,
+          claimantName,
+          claimantEmail,
+          claimantPhone: claimantPhone || undefined,
+          verificationAnswer,
+          message: message || 'Ready to coordinate pickup.',
+          status: 'pending',
           createdAt: nowIso,
           updatedAt: nowIso,
         };
 
-        store.items.unshift(newItem);
-        const matches = findPotentialMatches(newItem, store.items).map((m) =>
-          redactItemForViewer(m, reporterEmail),
-        );
+        item.claims.unshift(claim);
+        if (item.status === 'open') {
+          item.status = 'claimed';
+        }
+        item.updatedAt = nowIso;
 
         return {
-          result: { item: newItem, matches },
+          result: {
+            ok: true,
+            status: 201,
+            data: {
+              item: redactItemForViewer(item, claimantEmail),
+              claim,
+            },
+          },
           dirty: true,
         };
-      });
+      },
+    );
 
-      res.status(201).json(created);
-    } catch (err) {
-      console.error('POST /api/items error:', err);
-      res.status(500).json({ error: 'Failed to create report.' });
+    if (!outcome.ok) {
+      res.status(outcome.status).json({ error: outcome.error });
+      return;
     }
-  });
 
-  app.post('/api/items/:id/claims', async (req, res) => {
-    try {
-      const itemId = sanitizeText(req.params.id, 64);
-      const body = req.body ?? {};
-      const claimantName = sanitizeText(body.claimantName, 80);
-      const claimantEmail = sanitizeEmail(body.claimantEmail);
-      const claimantPhone = sanitizeText(body.claimantPhone, 30);
-      const verificationAnswer = sanitizeText(body.verificationAnswer, 300);
-      const message = sanitizeText(body.message, 500);
+    res.status(201).json(outcome.data);
+  } catch (err) {
+    console.error('POST /api/items/:id/claims error:', err);
+    res.status(500).json({ error: 'Failed to submit claim.' });
+  }
+});
 
-      if (!claimantName || !claimantEmail || !verificationAnswer) {
-        res.status(400).json({ error: 'Name, college email, and verification details are required.' });
-        return;
-      }
+apiRouter.patch('/items/:id/claims/:claimId', async (req, res) => {
+  try {
+    const itemId = sanitizeText(req.params.id, 64);
+    const claimId = sanitizeText(req.params.claimId, 64);
+    const body = req.body ?? {};
+    const actorEmail = sanitizeEmail(body.actorEmail);
+    const action = body.action === 'approve' || body.action === 'decline' ? body.action : null;
 
-      const outcome = await withStore<StoreOutcome<{ item: LostFoundItem; claim: ItemClaim }>>(
-        async (store) => {
-          const item = store.items.find((i) => i.id === itemId);
-          if (!item) {
-            return { result: { ok: false, error: 'Item not found.', status: 404 }, dirty: false };
-          }
-          if (item.status === 'returned') {
-            return {
-              result: { ok: false, error: 'This item has already been returned.', status: 400 },
-              dirty: false,
-            };
-          }
-
-          const nowIso = new Date().toISOString();
-          const claim: ItemClaim = {
-            id: `claim-${crypto.randomUUID().slice(0, 8)}`,
-            itemId: item.id,
-            claimantName,
-            claimantEmail,
-            claimantPhone: claimantPhone || undefined,
-            verificationAnswer,
-            message: message || 'Ready to coordinate pickup.',
-            status: 'pending',
-            createdAt: nowIso,
-            updatedAt: nowIso,
-          };
-
-          item.claims.unshift(claim);
-          if (item.status === 'open') {
-            item.status = 'claimed';
-          }
-          item.updatedAt = nowIso;
-
-          return {
-            result: {
-              ok: true,
-              status: 201,
-              data: {
-                item: redactItemForViewer(item, claimantEmail),
-                claim,
-              },
-            },
-            dirty: true,
-          };
-        },
-      );
-
-      if (!outcome.ok) {
-        res.status(outcome.status).json({ error: outcome.error });
-        return;
-      }
-
-      res.status(201).json(outcome.data);
-    } catch (err) {
-      console.error('POST /api/items/:id/claims error:', err);
-      res.status(500).json({ error: 'Failed to submit claim.' });
+    if (!actorEmail || !action) {
+      res.status(400).json({ error: 'Valid action and reporter email are required.' });
+      return;
     }
-  });
 
-  app.patch('/api/items/:id/claims/:claimId', async (req, res) => {
-    try {
-      const itemId = sanitizeText(req.params.id, 64);
-      const claimId = sanitizeText(req.params.claimId, 64);
-      const body = req.body ?? {};
-      const actorEmail = sanitizeEmail(body.actorEmail);
-      const action = body.action === 'approve' || body.action === 'decline' ? body.action : null;
-
-      if (!actorEmail || !action) {
-        res.status(400).json({ error: 'Valid action and reporter email are required.' });
-        return;
-      }
-
-      const outcome = await withStore<StoreOutcome<{ item: LostFoundItem }>>(async (store) => {
-        const item = store.items.find((i) => i.id === itemId);
-        if (!item) return { result: { ok: false, error: 'Item not found.', status: 404 }, dirty: false };
-        if (item.reporterEmail.toLowerCase() !== actorEmail) {
-          return {
-            result: {
-              ok: false,
-              error: 'Only the original reporter can review claims for this item.',
-              status: 403,
-            },
-            dirty: false,
-          };
-        }
-
-        const claim = item.claims.find((c) => c.id === claimId);
-        if (!claim) return { result: { ok: false, error: 'Claim not found.', status: 404 }, dirty: false };
-
-        const nowIso = new Date().toISOString();
-        const nextClaimStatus: ClaimStatus = action === 'approve' ? 'approved' : 'declined';
-        claim.status = nextClaimStatus;
-        claim.updatedAt = nowIso;
-
-        if (action === 'approve') {
-          item.status = 'returned';
-          item.returnedAt = nowIso;
-          for (const other of item.claims) {
-            if (other.id !== claim.id && other.status === 'pending') {
-              other.status = 'declined';
-              other.updatedAt = nowIso;
-            }
-          }
-        } else {
-          const hasPending = item.claims.some((c) => c.status === 'pending');
-          if (!hasPending && item.status === 'claimed') {
-            item.status = 'open';
-          }
-        }
-        item.updatedAt = nowIso;
-
-        return { result: { ok: true, status: 200, data: { item } }, dirty: true };
-      });
-
-      if (!outcome.ok) {
-        res.status(outcome.status).json({ error: outcome.error });
-        return;
-      }
-      res.json(outcome.data);
-    } catch (err) {
-      console.error('PATCH /api/items/:id/claims/:claimId error:', err);
-      res.status(500).json({ error: 'Failed to update claim.' });
-    }
-  });
-
-  app.patch('/api/items/:id/status', async (req, res) => {
-    try {
-      const itemId = sanitizeText(req.params.id, 64);
-      const body = req.body ?? {};
-      const actorEmail = sanitizeEmail(body.actorEmail);
-      const nextStatus: ItemStatus | null =
-        body.status === 'open' || body.status === 'claimed' || body.status === 'returned'
-          ? body.status
-          : null;
-
-      if (!actorEmail || !nextStatus) {
-        res.status(400).json({ error: 'Status and reporter email are required.' });
-        return;
-      }
-
-      const outcome = await withStore<StoreOutcome<{ item: LostFoundItem }>>(async (store) => {
-        const item = store.items.find((i) => i.id === itemId);
-        if (!item) return { result: { ok: false, error: 'Item not found.', status: 404 }, dirty: false };
-        if (item.reporterEmail.toLowerCase() !== actorEmail) {
-          return {
-            result: {
-              ok: false,
-              error: 'Only the original reporter can update this report.',
-              status: 403,
-            },
-            dirty: false,
-          };
-        }
-
-        const nowIso = new Date().toISOString();
-        item.status = nextStatus;
-        item.updatedAt = nowIso;
-        if (nextStatus === 'returned') {
-          item.returnedAt = nowIso;
-        } else {
-          item.returnedAt = undefined;
-        }
-        return { result: { ok: true, status: 200, data: { item } }, dirty: true };
-      });
-
-      if (!outcome.ok) {
-        res.status(outcome.status).json({ error: outcome.error });
-        return;
-      }
-      res.json(outcome.data);
-    } catch (err) {
-      console.error('PATCH /api/items/:id/status error:', err);
-      res.status(500).json({ error: 'Failed to update status.' });
-    }
-  });
-
-  app.patch('/api/items/:id/photo', async (req, res) => {
-    try {
-      const itemId = sanitizeText(req.params.id, 64);
-      const body = req.body ?? {};
-      const actorEmail = sanitizeEmail(body.actorEmail);
-      const nextImageUrl = body.imageUrl === null ? null : validateUploadUrl(body.imageUrl);
-      const storageProvider: PhotoStorageProvider | undefined =
-        body.storageProvider === 'drive' || body.storageProvider === 'system'
-          ? body.storageProvider
-          : undefined;
-      const driveFileId = sanitizeText(body.driveFileId, 160);
-      const rawDriveLink = sanitizeText(body.driveWebViewLink, 400);
-      const driveWebViewLink = rawDriveLink.startsWith('https://') ? rawDriveLink : undefined;
-
-      if (!actorEmail || (body.imageUrl !== null && !nextImageUrl)) {
-        res.status(400).json({ error: 'Valid photo URL and reporter email are required.' });
-        return;
-      }
-
-      let previousUploadUrl: string | undefined;
-      const outcome = await withStore<StoreOutcome<{ item: LostFoundItem }>>(async (store) => {
-        const item = store.items.find((i) => i.id === itemId);
-        if (!item) return { result: { ok: false, error: 'Item not found.', status: 404 }, dirty: false };
-        if (item.reporterEmail.toLowerCase() !== actorEmail) {
-          return {
-            result: {
-              ok: false,
-              error: 'Only the original reporter can update the photo for this report.',
-              status: 403,
-            },
-            dirty: false,
-          };
-        }
-
-        previousUploadUrl = item.imageUrl;
-        item.imageUrl = nextImageUrl ?? undefined;
-        if (nextImageUrl === null) {
-          item.imageDataUrl = undefined;
-          item.imageKey = undefined;
-          item.storageProvider = undefined;
-          item.driveFileId = undefined;
-          item.driveWebViewLink = undefined;
-        } else {
-          item.storageProvider = storageProvider ?? 'system';
-          item.driveFileId = driveFileId || undefined;
-          item.driveWebViewLink = driveWebViewLink;
-        }
-        item.updatedAt = new Date().toISOString();
-        return { result: { ok: true, status: 200, data: { item } }, dirty: true };
-      });
-
-      if (!outcome.ok) {
-        res.status(outcome.status).json({ error: outcome.error });
-        return;
-      }
-      if (previousUploadUrl && previousUploadUrl !== nextImageUrl) {
-        await tryRemoveUploadFile(previousUploadUrl);
-      }
-      res.json(outcome.data);
-    } catch (err) {
-      console.error('PATCH /api/items/:id/photo error:', err);
-      res.status(500).json({ error: 'Failed to update photo.' });
-    }
-  });
-
-  app.delete('/api/items/:id', async (req, res) => {
-    try {
-      const itemId = sanitizeText(req.params.id, 64);
-      const actorEmail = sanitizeEmail(req.query.actorEmail);
-
-      if (!actorEmail) {
-        res.status(400).json({ error: 'Reporter email is required to delete a report.' });
-        return;
-      }
-
-      let removedImageUrl: string | undefined;
-      const outcome = await withStore<StoreOutcome<{ ok: boolean }>>(async (store) => {
-        const index = store.items.findIndex((i) => i.id === itemId);
-        if (index === -1) {
-          return { result: { ok: false, error: 'Report not found.', status: 404 }, dirty: false };
-        }
-        if (store.items[index].reporterEmail.toLowerCase() !== actorEmail) {
-          return {
-            result: {
-              ok: false,
-              error: 'Only the original reporter can delete this report.',
-              status: 403,
-            },
-            dirty: false,
-          };
-        }
-        removedImageUrl = store.items[index].imageUrl;
-        store.items.splice(index, 1);
-        return { result: { ok: true, status: 200, data: { ok: true } }, dirty: true };
-      });
-
-      if (!outcome.ok) {
-        res.status(outcome.status).json({ error: outcome.error });
-        return;
-      }
-      await tryRemoveUploadFile(removedImageUrl);
-      res.json(outcome.data);
-    } catch (err) {
-      console.error('DELETE /api/items/:id error:', err);
-      res.status(500).json({ error: 'Failed to delete report.' });
-    }
-  });
-
-  app.get('/api/my-activity', async (req, res) => {
-    try {
-      const email = sanitizeEmail(req.query.email);
-      if (!email) {
-        res.json({ reportedItems: [], submittedClaims: [] });
-        return;
-      }
-
-      const data = await withStore(async (store) => {
-        const reportedItems = store.items
-          .filter((item) => item.reporterEmail.toLowerCase() === email)
-          .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
-
-        const submittedClaims: Array<{
-          claim: ItemClaim;
-          item: LostFoundItem;
-        }> = [];
-
-        for (const item of store.items) {
-          for (const claim of item.claims) {
-            if (claim.claimantEmail.toLowerCase() === email) {
-              submittedClaims.push({
-                claim,
-                item: redactItemForViewer(item, email),
-              });
-            }
-          }
-        }
-
-        submittedClaims.sort(
-          (a, b) => new Date(b.claim.createdAt).getTime() - new Date(a.claim.createdAt).getTime(),
-        );
-
+    const outcome = await withStore<StoreOutcome<{ item: LostFoundItem }>>(async (store) => {
+      const item = store.items.find((i) => i.id === itemId);
+      if (!item) return { result: { ok: false, error: 'Item not found.', status: 404 }, dirty: false };
+      if (item.reporterEmail.toLowerCase() !== actorEmail) {
         return {
-          result: { reportedItems, submittedClaims },
+          result: {
+            ok: false,
+            error: 'Only the original reporter can review claims for this item.',
+            status: 403,
+          },
           dirty: false,
         };
-      });
+      }
 
-      res.json(data);
-    } catch (err) {
-      console.error('GET /api/my-activity error:', err);
-      res.status(500).json({ error: 'Failed to load student activity.' });
+      const claim = item.claims.find((c) => c.id === claimId);
+      if (!claim) return { result: { ok: false, error: 'Claim not found.', status: 404 }, dirty: false };
+
+      const nowIso = new Date().toISOString();
+      const nextClaimStatus: ClaimStatus = action === 'approve' ? 'approved' : 'declined';
+      claim.status = nextClaimStatus;
+      claim.updatedAt = nowIso;
+
+      if (action === 'approve') {
+        item.status = 'returned';
+        item.returnedAt = nowIso;
+        for (const other of item.claims) {
+          if (other.id !== claim.id && other.status === 'pending') {
+            other.status = 'declined';
+            other.updatedAt = nowIso;
+          }
+        }
+      } else {
+        const hasPending = item.claims.some((c) => c.status === 'pending');
+        if (!hasPending && item.status === 'claimed') {
+          item.status = 'open';
+        }
+      }
+      item.updatedAt = nowIso;
+
+      return { result: { ok: true, status: 200, data: { item } }, dirty: true };
+    });
+
+    if (!outcome.ok) {
+      res.status(outcome.status).json({ error: outcome.error });
+      return;
     }
-  });
+    res.json(outcome.data);
+  } catch (err) {
+    console.error('PATCH /api/items/:id/claims/:claimId error:', err);
+    res.status(500).json({ error: 'Failed to update claim.' });
+  }
+});
 
+apiRouter.patch('/items/:id/status', async (req, res) => {
+  try {
+    const itemId = sanitizeText(req.params.id, 64);
+    const body = req.body ?? {};
+    const actorEmail = sanitizeEmail(body.actorEmail);
+    const nextStatus: ItemStatus | null =
+      body.status === 'open' || body.status === 'claimed' || body.status === 'returned'
+        ? body.status
+        : null;
+
+    if (!actorEmail || !nextStatus) {
+      res.status(400).json({ error: 'Status and reporter email are required.' });
+      return;
+    }
+
+    const outcome = await withStore<StoreOutcome<{ item: LostFoundItem }>>(async (store) => {
+      const item = store.items.find((i) => i.id === itemId);
+      if (!item) return { result: { ok: false, error: 'Item not found.', status: 404 }, dirty: false };
+      if (item.reporterEmail.toLowerCase() !== actorEmail) {
+        return {
+          result: {
+            ok: false,
+            error: 'Only the original reporter can update this report.',
+            status: 403,
+          },
+          dirty: false,
+        };
+      }
+
+      const nowIso = new Date().toISOString();
+      item.status = nextStatus;
+      item.updatedAt = nowIso;
+      if (nextStatus === 'returned') {
+        item.returnedAt = nowIso;
+      } else {
+        item.returnedAt = undefined;
+      }
+      return { result: { ok: true, status: 200, data: { item } }, dirty: true };
+    });
+
+    if (!outcome.ok) {
+      res.status(outcome.status).json({ error: outcome.error });
+      return;
+    }
+    res.json(outcome.data);
+  } catch (err) {
+    console.error('PATCH /api/items/:id/status error:', err);
+    res.status(500).json({ error: 'Failed to update status.' });
+  }
+});
+
+apiRouter.patch('/items/:id/photo', async (req, res) => {
+  try {
+    const itemId = sanitizeText(req.params.id, 64);
+    const body = req.body ?? {};
+    const actorEmail = sanitizeEmail(body.actorEmail);
+    const nextImageUrl = body.imageUrl === null ? null : validateUploadUrl(body.imageUrl);
+    const storageProvider: PhotoStorageProvider | undefined =
+      body.storageProvider === 'drive' || body.storageProvider === 'system'
+        ? body.storageProvider
+        : undefined;
+    const driveFileId = sanitizeText(body.driveFileId, 160);
+    const rawDriveLink = sanitizeText(body.driveWebViewLink, 400);
+    const driveWebViewLink = rawDriveLink.startsWith('https://') ? rawDriveLink : undefined;
+
+    if (!actorEmail || (body.imageUrl !== null && !nextImageUrl)) {
+      res.status(400).json({ error: 'Valid photo URL and reporter email are required.' });
+      return;
+    }
+
+    let previousUploadUrl: string | undefined;
+    const outcome = await withStore<StoreOutcome<{ item: LostFoundItem }>>(async (store) => {
+      const item = store.items.find((i) => i.id === itemId);
+      if (!item) return { result: { ok: false, error: 'Item not found.', status: 404 }, dirty: false };
+      if (item.reporterEmail.toLowerCase() !== actorEmail) {
+        return {
+          result: {
+            ok: false,
+            error: 'Only the original reporter can update the photo for this report.',
+            status: 403,
+          },
+          dirty: false,
+        };
+      }
+
+      previousUploadUrl = item.imageUrl;
+      item.imageUrl = nextImageUrl ?? undefined;
+      if (nextImageUrl === null) {
+        item.imageDataUrl = undefined;
+        item.imageKey = undefined;
+        item.storageProvider = undefined;
+        item.driveFileId = undefined;
+        item.driveWebViewLink = undefined;
+      } else {
+        item.storageProvider = storageProvider ?? 'system';
+        item.driveFileId = driveFileId || undefined;
+        item.driveWebViewLink = driveWebViewLink;
+      }
+      item.updatedAt = new Date().toISOString();
+      return { result: { ok: true, status: 200, data: { item } }, dirty: true };
+    });
+
+    if (!outcome.ok) {
+      res.status(outcome.status).json({ error: outcome.error });
+      return;
+    }
+    if (previousUploadUrl && previousUploadUrl !== nextImageUrl) {
+      await tryRemoveUploadFile(previousUploadUrl);
+    }
+    res.json(outcome.data);
+  } catch (err) {
+    console.error('PATCH /api/items/:id/photo error:', err);
+    res.status(500).json({ error: 'Failed to update photo.' });
+  }
+});
+
+apiRouter.delete('/items/:id', async (req, res) => {
+  try {
+    const itemId = sanitizeText(req.params.id, 64);
+    const actorEmail = sanitizeEmail(req.query.actorEmail);
+
+    if (!actorEmail) {
+      res.status(400).json({ error: 'Reporter email is required to delete a report.' });
+      return;
+    }
+
+    let removedImageUrl: string | undefined;
+    const outcome = await withStore<StoreOutcome<{ ok: boolean }>>(async (store) => {
+      const index = store.items.findIndex((i) => i.id === itemId);
+      if (index === -1) {
+        return { result: { ok: false, error: 'Report not found.', status: 404 }, dirty: false };
+      }
+      if (store.items[index].reporterEmail.toLowerCase() !== actorEmail) {
+        return {
+          result: {
+            ok: false,
+            error: 'Only the original reporter can delete this report.',
+            status: 403,
+          },
+          dirty: false,
+        };
+      }
+      removedImageUrl = store.items[index].imageUrl;
+      store.items.splice(index, 1);
+      return { result: { ok: true, status: 200, data: { ok: true } }, dirty: true };
+    });
+
+    if (!outcome.ok) {
+      res.status(outcome.status).json({ error: outcome.error });
+      return;
+    }
+    await tryRemoveUploadFile(removedImageUrl);
+    res.json(outcome.data);
+  } catch (err) {
+    console.error('DELETE /api/items/:id error:', err);
+    res.status(500).json({ error: 'Failed to delete report.' });
+  }
+});
+
+apiRouter.get('/my-activity', async (req, res) => {
+  try {
+    const email = sanitizeEmail(req.query.email);
+    if (!email) {
+      res.json({ reportedItems: [], submittedClaims: [] });
+      return;
+    }
+
+    const data = await withStore(async (store) => {
+      const reportedItems = store.items
+        .filter((item) => item.reporterEmail.toLowerCase() === email)
+        .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+      const submittedClaims: Array<{
+        claim: ItemClaim;
+        item: LostFoundItem;
+      }> = [];
+
+      for (const item of store.items) {
+        for (const claim of item.claims) {
+          if (claim.claimantEmail.toLowerCase() === email) {
+            submittedClaims.push({
+              claim,
+              item: redactItemForViewer(item, email),
+            });
+          }
+        }
+      }
+
+      submittedClaims.sort(
+        (a, b) => new Date(b.claim.createdAt).getTime() - new Date(a.claim.createdAt).getTime(),
+      );
+
+      return {
+        result: { reportedItems, submittedClaims },
+        dirty: false,
+      };
+    });
+
+    res.json(data);
+  } catch (err) {
+    console.error('GET /api/my-activity error:', err);
+    res.status(500).json({ error: 'Failed to load student activity.' });
+  }
+});
+
+app.use('/api', apiRouter);
+app.use('/.netlify/functions/api', apiRouter);
+if (isServerless) {
+  app.use('/', apiRouter);
+}
+
+export async function startServer() {
   if (process.env.NODE_ENV === 'production') {
     const distDir = path.join(process.cwd(), 'dist');
     app.use(express.static(distDir));
@@ -1048,7 +1076,19 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Fatal server startup error:', err);
-  process.exit(1);
-});
+const currentFile = fileURLToPath(import.meta.url);
+const entryFile = process.argv[1] ? path.resolve(process.argv[1]) : '';
+const isDirectExecution =
+  entryFile !== '' &&
+  (entryFile === currentFile ||
+    entryFile.replace(/\.(ts|mts|js|mjs)$/, '') ===
+      currentFile.replace(/\.(ts|mts|js|mjs)$/, ''));
+
+if (!isServerless && isDirectExecution) {
+  startServer().catch((err) => {
+    console.error('Fatal server startup error:', err);
+    process.exit(1);
+  });
+}
+
+export default app;
